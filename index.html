@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FS Live Monitor</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="config.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2330; --mute:#677085; --line:#e3e6ec; --ok:#1a7f4b; --warn:#b26a00; --bad:#c0392b; --acc:#2f6fd6; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#12151b; --card:#1b1f27; --ink:#e7eaf0; --mute:#97a0b3; --line:#2b313c; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; }
+  header { padding:14px 16px 6px; display:flex; flex-wrap:wrap; gap:8px 16px; align-items:center; }
+  h1 { font-size:18px; margin:0; flex:1 1 300px; }
+  .ctl { display:flex; gap:10px; align-items:center; flex-wrap:wrap; font-size:13px; color:var(--mute); }
+  select { font:inherit; padding:5px 8px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); max-width:100%; }
+  #status { font-size:13px; color:var(--mute); padding:0 16px; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; background:var(--mute); }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; padding:8px 16px; }
+  .tile { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
+  .tile .k { font-size:12px; color:var(--mute); text-transform:uppercase; letter-spacing:.04em; }
+  .tile .v { font-size:24px; font-weight:650; font-variant-numeric:tabular-nums; }
+  .tile .s { font-size:12px; color:var(--mute); }
+  .charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr)); gap:10px; padding:8px 16px 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px; height:260px; }
+  .card h2 { font-size:13px; margin:0 0 4px; color:var(--mute); font-weight:600; }
+  .card canvas { height:220px !important; }
+  #msg { margin:16px; padding:12px 14px; border-radius:10px; background:var(--card); border:1px solid var(--line); display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Friction surfacing: closed-loop power control monitor</h1>
+  <div class="ctl">
+    <label>Run <select id="run"></select></label>
+    <label><input type="checkbox" id="follow" checked> follow newest run</label>
+  </div>
+</header>
+<div id="status"><span class="dot" id="dot"></span><span id="stxt">connecting…</span></div>
+<div id="msg"></div>
+<section class="tiles">
+  <div class="tile"><div class="k">Spindle speed</div><div class="v" id="t_rpm">–</div><div class="s" id="t_drpm">change –</div></div>
+  <div class="tile"><div class="k">Net power</div><div class="v" id="t_p">–</div><div class="s" id="t_ref">reference –</div></div>
+  <div class="tile"><div class="k">Error vs reference</div><div class="v" id="t_err">–</div><div class="s">within 1 % = on target</div></div>
+  <div class="tile"><div class="k">Phase current</div><div class="v" id="t_i">–</div><div class="s">alarm at 14 A</div></div>
+  <div class="tile"><div class="k">Learned gain K</div><div class="v" id="t_k">–</div><div class="s">W per rpm</div></div>
+  <div class="tile"><div class="k">Power steadiness</div><div class="v" id="t_cov">–</div><div class="s">CoV, last 10 s</div></div>
+</section>
+<section class="charts">
+  <div class="card"><h2>Net power and reference (W)</h2><canvas id="c_p"></canvas></div>
+  <div class="card"><h2>Spindle speed command (rpm)</h2><canvas id="c_n"></canvas></div>
+  <div class="card"><h2>Speed change per second (rpm)</h2><canvas id="c_dn"></canvas></div>
+  <div class="card"><h2>Max phase current (A rms)</h2><canvas id="c_i"></canvas></div>
+</section>
+<script>
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const fmt = (v, d=0) => v == null || isNaN(v) ? '–' : Number(v).toFixed(d);
+Chart.defaults.color = css('--mute'); Chart.defaults.borderColor = css('--line');
+Chart.defaults.animation = false; Chart.defaults.maintainAspectRatio = false;
+const mk = (id, sets, type='line') => new Chart($(id), {
+  type, data:{datasets:sets.map(s => ({pointRadius:0, borderWidth:2, tension:.2, ...s}))},
+  options:{plugins:{legend:{display:sets.length>1, labels:{boxWidth:12}}},
+           scales:{x:{type:'linear', title:{display:true,text:'time (s)'}}}}});
+const cP = mk('c_p', [{label:'net power', borderColor:'#d64545', data:[]},
+                      {label:'reference', borderColor:'#888', borderDash:[6,4], data:[]},
+                      {label:'total', borderColor:'#e69a3a', borderWidth:1, data:[]}]);
+const cN = mk('c_n', [{label:'rpm', borderColor:'#2f6fd6', data:[]}]);
+const cD = mk('c_dn', [{label:'Δrpm', backgroundColor:'#7a4fc9', data:[]}], 'bar');
+const cI = mk('c_i', [{label:'A', borderColor:'#1a8a5a', data:[]}]);
+
+let rows = [], runId = null, channel = null, lastRx = 0;
+const MAX = 3600;   // points kept on screen (1 h at 1 Hz)
+
+function render() {
+  const R = rows;
+  const pts = k => R.map(r => ({x:r.t_s, y:r[k]}));
+  cP.data.datasets[0].data = pts('y'); cP.data.datasets[1].data = pts('ref'); cP.data.datasets[2].data = pts('power_w');
+  cN.data.datasets[0].data = pts('u');
+  cD.data.datasets[0].data = R.map((r,i) => ({x:r.t_s, y: i ? r.u - R[i-1].u : 0}));
+  cI.data.datasets[0].data = pts('i_rms_max_a');
+  [cP,cN,cD,cI].forEach(c => c.update());
+  if (!R.length) { ['t_rpm','t_p','t_err','t_i','t_k','t_cov'].forEach(i => $(i).textContent = '–'); return; }
+  const L = R[R.length-1], P = R.length > 1 ? R[R.length-2] : L;
+  $('t_rpm').textContent = fmt(L.u) + ' rpm';
+  $('t_drpm').textContent = 'change ' + (L.u - P.u >= 0 ? '+' : '') + fmt(L.u - P.u) + ' rpm';
+  $('t_p').textContent = fmt(L.y) + ' W';
+  $('t_ref').textContent = 'reference ' + (L.ref == null ? 'not set yet' : fmt(L.ref) + ' W');
+  const e = L.ref ? (L.y - L.ref) / L.ref * 100 : null;
+  $('t_err').textContent = e == null ? '–' : (e >= 0 ? '+' : '') + fmt(e, 1) + ' %';
+  $('t_err').style.color = e == null ? '' : Math.abs(e) <= 1 ? css('--ok') : Math.abs(e) <= 5 ? css('--warn') : css('--bad');
+  $('t_i').textContent = fmt(L.i_rms_max_a, 2) + ' A';
+  $('t_i').style.color = L.i_rms_max_a > 12 ? css('--bad') : '';
+  $('t_k').textContent = fmt(L.k_hat, 3);
+  const w = R.filter(r => r.t_s > L.t_s - 10).map(r => r.y);
+  const m = w.reduce((a,b)=>a+b,0)/w.length, sd = Math.sqrt(w.reduce((a,b)=>a+(b-m)**2,0)/w.length);
+  $('t_cov').textContent = m > 50 ? fmt(sd/m, 3) : '–';
+}
+
+function status() {
+  const live = Date.now() - lastRx < 5000;
+  $('dot').style.background = live ? css('--ok') : css('--mute');
+  const L = rows[rows.length-1];
+  $('stxt').textContent = (live ? 'live' : 'not receiving new data') + (L ? ` · t = ${fmt(L.t_s)} s · ${rows.length} points` : '');
+}
+setInterval(status, 1000);
+
+function showMsg(html) { $('msg').innerHTML = html; $('msg').style.display = 'block'; }
+
+/* ---------- demo mode (?demo=1): no database, invented data, for checking the page ---------- */
+function startDemo() {
+  showMsg('Demo mode: invented data, not a real run.');
+  $('run').innerHTML = '<option>demo</option>';
+  let t = 0, n = 2000, ref = null, k = 0.35;
+  setInterval(() => {
+    t += 1;
+    const drift = t > 8 ? 1 + 0.12 * (1 - Math.exp(-(t - 8) / 15)) : 0;
+    let y = t > 8 ? 1250 * Math.sqrt(n / 2000) * drift * (1 + 0.02 * Math.sin(t)) : 0;
+    if (t === 15) ref = y;
+    if (ref && t > 15) n = Math.max(1500, Math.min(4000, n + Math.max(-50, Math.min(50, 0.4 * (ref - y) / k))));
+    rows.push({t_s:t, u:n, y, ref, k_hat:k, power_w:y + 200, i_rms_max_a:0.6 + y / 330});
+    lastRx = Date.now(); render();
+  }, 1000);
+}
+
+/* ---------- Supabase mode ---------- */
+let sb;
+async function loadRuns(selectNewest) {
+  const { data, error } = await sb.from('runs').select('id,name,mode,started_at,note').order('id', {ascending:false}).limit(100);
+  if (error) { showMsg('Could not read runs: ' + error.message); return; }
+  $('run').innerHTML = data.map(r => `<option value="${r.id}">#${r.id} · ${r.name}${r.note ? ' · ' + r.note : ''} · ${new Date(r.started_at).toLocaleString()}</option>`).join('');
+  if (!data.length) { $('stxt').textContent = 'no runs yet: start run_loop.py and push_to_cloud.py'; return; }
+  if (selectNewest || runId == null) await openRun(data[0].id);
+  else $('run').value = runId;
+}
+
+async function openRun(id) {
+  runId = Number(id); $('run').value = runId; rows = []; render();
+  let from = 0;
+  while (true) {   // page through the run (1000 rows per request)
+    const { data, error } = await sb.from('samples').select('*').eq('run_id', runId).order('t_s').range(from, from + 999);
+    if (error) { showMsg('Could not read samples: ' + error.message); break; }
+    rows.push(...data); if (data.length < 1000) break; from += 1000;
+  }
+  rows = rows.slice(-MAX); render();
+  if (channel) sb.removeChannel(channel);
+  channel = sb.channel('samples-' + runId)
+    .on('postgres_changes', {event:'INSERT', schema:'public', table:'samples', filter:`run_id=eq.${runId}`}, p => {
+      rows.push(p.new); if (rows.length > MAX) rows.shift(); lastRx = Date.now(); render();
+    }).subscribe();
+}
+
+function startSupabase() {
+  const c = window.FS_CONFIG || {};
+  if (!c.supabaseUrl || c.supabaseUrl.includes('YOUR-PROJECT')) {
+    showMsg('Not configured yet: put your Supabase URL and anon key in <code>config.js</code>, or open this page with <code>?demo=1</code>.');
+    return;
+  }
+  sb = supabase.createClient(c.supabaseUrl, c.supabaseAnonKey);
+  $('run').onchange = e => { $('follow').checked = false; openRun(e.target.value); };
+  sb.channel('runs').on('postgres_changes', {event:'INSERT', schema:'public', table:'runs'},
+    () => loadRuns($('follow').checked)).subscribe();
+  loadRuns(true);
+}
+
+new URLSearchParams(location.search).has('demo') ? startDemo() : startSupabase();
+</script>
+</body>
+</html>
